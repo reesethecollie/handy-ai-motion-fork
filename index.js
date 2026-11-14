@@ -23,6 +23,12 @@ const defaultSettings = {
     stopWords: "stop,pause", // [glide mod] Words in the user's message that halt the device at once
     variation: 0.8,          // [glide mod] 0-1: how much natural variation is added when the rhythm is not "even"
     buildIntervalSec: 20,    // [glide mod] seconds per pace level while "building" or "easing"
+    releaseIntervalSec: 8,   // [glide mod] seconds per pace level while the character is letting the user finish
+    finishCarrySec: 6,       // [glide mod] after "I'm cumming", keep going this long before easing down
+    comingWords: "i'm cumming,im cumming,i am cumming,cumming,i'm coming,im coming", // [glide mod] carry through, then ease to a stop
+    cameWords: "i came,i just came,i finished,i'm finished,im finished,i'm done,im done,i'm spent", // [glide mod] ease to a stop now
+    secretGoalMin: 3,        // [glide mod] smallest edge goal the character may pick when asked to decide
+    secretGoalMax: 13,       // [glide mod] largest
     edgeCooldownSec: 8,      // [glide mod] shortest time the device stays still after "edge"
     edgeCooldownMaxSec: 15,  // [glide mod] longest time; the actual hold is picked at random in between
     edgeWords: "edge",       // [glide mod] in a short message: full stop and hold
@@ -997,6 +1003,10 @@ const Session = {
     stopRequested: false,   // the user said stop: nothing restarts until they speak again
     idleTimer: null,
     fallbackTimer: null,
+    goalSecret: false,      // the character picked the edge goal and keeps the number to himself
+    releasing: false,       // the character is letting the user finish: "I'm close" no longer backs off
+    finishPendingAck: false,// the user finished and the character has not replied yet
+    finishTimer: null,
 };
 
 /** [glide mod] True when a device is connected (or testing without one). */
@@ -1026,6 +1036,7 @@ const Glide = {
     pending: null,        // target received during an edge cooldown
     jitter: 0,            // slow random drift of stroke speed
     fx: null,             // short-lived variation: { type, left }
+    finishLeft: 0,        // slow strokes left after the user has finished
     sinceFx: 0,
 
     paceToSpeed(pace, settings) {
@@ -1062,7 +1073,9 @@ const Glide = {
         if (buildTo !== null) {
             buildTo = isFinite(buildTo) ? Math.max(1, Math.min(10, buildTo)) : null;
         }
-        return { pace, lo, hi, hold, vary, buildTo };
+        const release = !!t.release;
+        if (release && buildTo === null && pace > 0 && pace < 10) buildTo = 10; // a release always climbs to the top
+        return { pace, lo, hi, hold, vary, buildTo, release };
     },
 
     /** Sets new settings to glide toward. pace 0 eases down and stops. */
@@ -1080,6 +1093,7 @@ const Glide = {
         }
 
         if (target.pace <= 0) {
+            Session.releasing = false;
             this.build = null;
             if (this.active) {
                 this.stopping = true;
@@ -1091,10 +1105,12 @@ const Glide = {
 
         this.stopping = false;
         this.easedOut = false;
+        this.finishLeft = 0;
         this.tgt = { pace: target.pace, lo: target.lo, hi: target.hi, hold: target.hold, vary: target.vary };
+        if (target.release) Session.releasing = true;
 
         if (target.buildTo !== null && target.buildTo !== target.pace) {
-            const interval = Math.max(5, Number(settings.buildIntervalSec) || 20) * 1000;
+            const interval = this.buildInterval(settings);
             this.build = { to: target.buildTo, dir: target.buildTo > target.pace ? 1 : -1, nextAt: Date.now() + interval };
         } else {
             this.build = null;
@@ -1136,7 +1152,7 @@ const Glide = {
 
         // Self-building pace: raise or lower the target one level at a time
         if (this.build && !this.stopping && Date.now() >= this.build.nextAt) {
-            const interval = Math.max(5, Number(settings.buildIntervalSec) || 20) * 1000;
+            const interval = this.buildInterval(settings);
             const next = this.tgt.pace + this.build.dir;
             if ((this.build.dir > 0 && next >= this.build.to) || (this.build.dir < 0 && next <= this.build.to)) {
                 this.tgt.pace = this.build.to;
@@ -1145,6 +1161,12 @@ const Glide = {
                 this.tgt.pace = next;
                 this.build.nextAt = Date.now() + interval;
             }
+        }
+
+        // After the user has finished: a few slow strokes, then rest
+        if (this.finishLeft > 0 && !this.stopping) {
+            this.finishLeft--;
+            if (this.finishLeft === 0) this.stopping = true;
         }
 
         // Ease toward the target a little on every half-stroke
@@ -1168,7 +1190,8 @@ const Glide = {
         }
 
         // Natural variation (off for an "even" rhythm and while easing to a stop)
-        const amount = (this.stopping || !this.cur.vary) ? 0 : Math.max(0, Math.min(1, Number(settings.variation ?? 0.8)));
+        // During a release the rhythm stays driving: less drift, no pauses or slow strokes
+        const amount = (this.stopping || !this.cur.vary) ? 0 : Math.max(0, Math.min(1, Number(settings.variation ?? 0.8))) * (Session.releasing ? 0.6 : 1);
         let speedFactor = 1;
         let extraPause = 0;
         let shape = null; // 'short' | 'high' | 'low'
@@ -1182,11 +1205,11 @@ const Glide = {
             // a slightly quicker run, a short stroke, or a flutter of short strokes at one end
             this.sinceFx++;
             if (!this.fx && this.sinceFx > 4 && Math.random() < 0.2 * amount) {
-                const types = ['pause', 'slow', 'burst', 'short', 'flutter'];
+                const types = Session.releasing ? ['burst', 'burst', 'flutter'] : ['pause', 'slow', 'burst', 'short', 'flutter'];
                 const type = types[Math.floor(Math.random() * types.length)];
                 const extra = Math.floor(Math.random() * 3);
                 const left = { pause: 1, slow: 2 + extra, burst: 4 + extra, short: 2, flutter: 6 + 2 * extra }[type];
-                this.fx = { type, left, high: Math.random() < 0.6 };
+                this.fx = { type, left, high: Session.releasing ? true : Math.random() < 0.6 };
             }
             if (this.fx) {
                 if (this.fx.type === 'pause') extraPause = 300 + Math.round(Math.random() * 600);
@@ -1250,6 +1273,7 @@ const Glide = {
     edge(settings) {
         const pos = MoveTracker.estimate();
         Session.preEdgePace = Math.round(this.tgt.pace) || Math.round(this.cur.pace) || 3;
+        Session.releasing = false;
         this.halt();
         this.pending = null;
         updatePlaybackStatus(false);
@@ -1335,7 +1359,29 @@ const Glide = {
         this.easedOut = false;
         this.build = null;
         this.fx = null;
+        this.finishLeft = 0;
         this.cur.pace = 0;
+    },
+
+    /** Seconds between pace levels while building: quicker during a release. */
+    buildInterval(settings) {
+        if (Session.releasing) return Math.max(3, Number(settings.releaseIntervalSec) || 8) * 1000;
+        return Math.max(5, Number(settings.buildIntervalSec) || 20) * 1000;
+    },
+
+    /** The user has finished: drop to a few slow, even strokes and then rest. */
+    finish() {
+        if (!this.active) return;
+        this.build = null;
+        this.fx = null;
+        this.jitter = 0;
+        this.stopping = false;
+        this.easedOut = false;
+        this.tgt.pace = 1;
+        this.tgt.vary = 0;
+        this.cur.pace = Math.min(this.cur.pace, 3);
+        this.finishLeft = 2;
+        console.log(`${LOG_PREFIX} Finished: easing to a stop`);
     },
 
     /** Shows the live pace and edge count in the extension panel. */
@@ -1355,8 +1401,9 @@ const Glide = {
             text = "Idle";
         }
         if (Session.edgeCount > 0 || Session.edgeGoal > 0) {
-            text += ` | Edges ${Session.edgeCount}${Session.edgeGoal ? '/' + Session.edgeGoal : ''}`;
+            text += ` | Edges ${Session.edgeCount}${Session.edgeGoal ? '/' + (Session.goalSecret ? '?' : Session.edgeGoal) : ''}`;
         }
+        if (Session.releasing && this.active) text += ' | Finishing';
         el.textContent = text;
     },
 };
@@ -1368,6 +1415,7 @@ function emergencyStop() {
     const pos = MoveTracker.estimate();
     Glide.cancelCooldown();
     clearFollowUpTimers();
+    Session.releasing = false;
     Session.stopRequested = true;
     Session.queuedFollowUp = null;
     stopPlayback();
@@ -1402,6 +1450,45 @@ function clearFollowUpTimers() {
         clearTimeout(Session.fallbackTimer);
         Session.fallbackTimer = null;
     }
+    if (Session.finishTimer) {
+        clearTimeout(Session.finishTimer);
+        Session.finishTimer = null;
+    }
+}
+
+/**
+ * [glide mod] The user has finished (or is finishing). The touch carries on for carryMs, then
+ * eases to a stop by itself. Nothing restarts and the edge count starts over.
+ */
+function endWithFinish(carryMs) {
+    clearFollowUpTimers();
+    Glide.cancelCooldown();
+    Glide.build = null; // hold this pace through it
+    Session.finishPendingAck = true;
+    Session.releasing = false;
+    Session.edgeCount = 0;
+    Session.edgeGoal = 0;
+    Session.goalSecret = false;
+    Session.lastEdgeAt = 0;
+    if (carryMs > 0) {
+        Session.finishTimer = setTimeout(() => {
+            Session.finishTimer = null;
+            Glide.finish();
+        }, carryMs);
+    } else {
+        Glide.finish();
+    }
+}
+
+/**
+ * [glide mod] True if the user hands the choice of edge goal to the character,
+ * e.g. "you decide how many edges" or "secret edge goal".
+ */
+function wantsSecretGoal(text) {
+    if (!text) return false;
+    const lower = String(text).toLowerCase().replace(/[\u2018\u2019]/g, "'");
+    if (!/\b(edges?|edging|goal)\b/.test(lower)) return false;
+    return /\b(you decide|you choose|you pick|your choice|your call|up to you|surprise me|secret|don't tell me|dont tell me)\b/.test(lower);
 }
 
 /**
@@ -1522,13 +1609,22 @@ function updateSessionNote() {
         } else if (Session.followUpReason === 'final') {
             parts.push(`${user} has stayed quiet for a long time. ${char} eases off: this reply ends with the hand still, and he checks in gently.`);
         }
+        if (Session.finishPendingAck) {
+            parts.push(`${user} has just finished. The touch is easing to a stop by itself. This reply is calm and warm, ends with the hand still, and ${char} does not start again unless ${user} asks.`);
+        } else if (Session.releasing) {
+            parts.push(`${char} is letting ${user} finish now. He does not back off or stop, even if ${user} says he is close, and every last line includes the word "finishing" until ${user} says he came.`);
+        }
         if (Session.edgeCount > 0 || Session.edgeGoal > 0) {
             let s = `Edges so far: ${Session.edgeCount}`;
             if (Session.edgeGoal > 0) {
-                s += ` of a goal of ${Session.edgeGoal}.`;
-                s += Session.edgeCount >= Session.edgeGoal
-                    ? ` The goal is reached, so ${char} may let ${user} finish.`
-                    : ` ${char} does not let ${user} finish before the goal.`;
+                s += Session.goalSecret
+                    ? ` of a secret goal of ${Session.edgeGoal}. ${char} chose this number himself and keeps it secret: he never tells ${user} the number or how many are left, though he can tease about it.`
+                    : ` of a goal of ${Session.edgeGoal}.`;
+                if (!Session.releasing) {
+                    s += Session.edgeCount >= Session.edgeGoal
+                        ? ` The goal is reached. ${char} may let ${user} finish, and does so when ${user} asks: the last line keeps the current pace number and adds "building to 10, finishing".`
+                        : ` ${char} does not let ${user} finish before the goal.`;
+                }
             } else {
                 s += '.';
             }
@@ -1622,7 +1718,10 @@ function parseMotionLine(text) {
     if (up) buildTo = up[1] ? parseFloat(up[1]) : Math.min(10, pace + 2);
     else if (down) buildTo = down[1] ? parseFloat(down[1]) : Math.max(1, pace - 2);
 
-    return { pace, min, max, hold, vary, buildTo };
+    // "finishing": the character is letting the user finish
+    const release = /\b(finishing|finish|releasing|release)\b/.test(line);
+
+    return { pace, min, max, hold, vary, buildTo, release };
 }
 
 /**
@@ -2325,6 +2424,15 @@ async function onMessageReceived(messageId) {
             return;
         }
         const answeredClose = Session.closePendingAck;
+        if (Session.finishPendingAck) {
+            // The user has finished: the touch is winding down by itself, whatever this reply says
+            Session.finishPendingAck = false;
+            Session.edgePendingAck = false;
+            Session.closePendingAck = false;
+            Session.followUpReason = null;
+            Session.awaitingFollowUp = false;
+            return;
+        }
         Session.edgePendingAck = false;
         Session.closePendingAck = false;
         Session.followUpReason = null;
@@ -2622,18 +2730,32 @@ async function initExtension() {
             const goal = parseEdgeGoal(text);
             if (goal > 0) {
                 Session.edgeGoal = goal;
+                Session.goalSecret = false;
                 Session.edgeCount = 0;
                 Session.lastEdgeAt = 0;
                 toastr?.info?.(`Edge goal set to ${goal}`, 'Handy AI Motion');
+            } else if (wantsSecretGoal(text)) {
+                const lo = Math.max(1, Math.round(Number(cfg.secretGoalMin) || 3));
+                const hi = Math.max(lo, Math.round(Number(cfg.secretGoalMax) || 13));
+                Session.edgeGoal = lo + Math.floor(Math.random() * (hi - lo + 1));
+                Session.goalSecret = true;
+                Session.edgeCount = 0;
+                Session.lastEdgeAt = 0;
+                toastr?.info?.('Secret edge goal set', 'Handy AI Motion');
             } else if (/\breset edges?\b/i.test(text)) {
                 Session.edgeCount = 0;
                 Session.edgeGoal = 0;
+                Session.goalSecret = false;
                 Session.lastEdgeAt = 0;
+            } else if (moving && isEdgeCall(text, cfg.cameWords)) {
+                endWithFinish(0);
+            } else if (moving && isEdgeCall(text, cfg.comingWords)) {
+                endWithFinish(Math.max(0, Number(cfg.finishCarrySec ?? 6)) * 1000);
             } else if (moving && isEdgeCall(text, cfg.edgeWords)) {
                 countEdge();
                 Session.edgePendingAck = true;
                 Glide.edge(cfg);
-            } else if (moving && isEdgeCall(text, cfg.closeWords)) {
+            } else if (moving && !Session.releasing && isEdgeCall(text, cfg.closeWords)) {
                 countEdge();
                 Session.closePendingAck = true;
                 Glide.backOff();
@@ -2679,6 +2801,9 @@ async function initExtension() {
         Session.awaitingFollowUp = false;
         Session.unprompted = 0;
         Session.stopRequested = false;
+        Session.goalSecret = false;
+        Session.releasing = false;
+        Session.finishPendingAck = false;
         clearFollowUpTimers();
         Glide.cancelCooldown();
         if (Glide.active) Glide.setTarget({ pace: 0 }); // leaving the chat eases the touch to a stop
