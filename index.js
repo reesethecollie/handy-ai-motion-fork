@@ -37,6 +37,8 @@ const defaultSettings = {
     autoFollowUp: true,      // [glide mod] the character speaks again by himself when you stay quiet during a session
     followUpSec: 40,         // [glide mod] roughly how long he waits before speaking again
     followUpMax: 8,          // [glide mod] unprompted replies in a row before he winds down and waits for you
+    readyGate: true,         // [glide mod] nothing moves until the user signals that he is ready
+    readyWords: "ready,i'm ready,im ready,i am ready,toy's ready,toy is ready,all set", // [glide mod] the signal
     simulateDevice: false,   // [glide mod] testing only: run the engine with no device connected
     analysisPrompt: `AI MESSAGE:
 """
@@ -669,6 +671,9 @@ function handleIntifaceMessage(msg) {
             IntifaceState.deviceCapabilities = { canLinear: false, canStopDevice: false };
             updateDeviceStatus(false);
             stopPlayback();
+            Session.ready = false; // [glide mod] a lost device has to be signalled ready again
+            Session.readyPendingAck = false;
+            Glide.report();
             console.log(`${LOG_PREFIX} Device removed`);
         }
         return;
@@ -723,6 +728,9 @@ function connectIntiface() {
         updateIntifaceStatus(false);
         updateDeviceStatus(false);
         IntifaceState.defaultDeviceIndex = null;
+        Session.ready = false; // [glide mod]
+        Session.readyPendingAck = false;
+        Glide.report();
         console.log(`${LOG_PREFIX} WebSocket closed`);
 
         const settings = getConfig();
@@ -780,6 +788,9 @@ function disconnectIntiface() {
     updateIntifaceStatus(false);
     updateDeviceStatus(false);
     IntifaceState.defaultDeviceIndex = null;
+    Session.ready = false; // [glide mod]
+    Session.readyPendingAck = false;
+    Glide.report();
     console.log(`${LOG_PREFIX} Disconnected`);
 }
 
@@ -1007,11 +1018,55 @@ const Session = {
     releasing: false,       // the character is letting the user finish: "I'm close" no longer backs off
     finishPendingAck: false,// the user finished and the character has not replied yet
     finishTimer: null,
+    ready: false,           // the user has signalled that he is ready for the touch to start
+    readyPendingAck: false, // he just said so and the character has not replied yet
 };
 
 /** [glide mod] True when a device is connected (or testing without one). */
 function deviceAvailable() {
     return IntifaceState.defaultDeviceIndex !== null || !!getConfig().simulateDevice;
+}
+
+/** [glide mod] True while the ready gate is holding everything still. */
+function gateLocked() {
+    const cfg = getConfig();
+    return !!cfg.glideMode && cfg.readyGate !== false && !Session.ready;
+}
+
+/** [glide mod] True if the user's message is the ready signal ("ready", "I'm ready"), not a question. */
+function isReadyCall(text, cfg) {
+    if (!text || /\?\s*$/.test(String(text).trim())) return false;
+    const lower = String(text).toLowerCase().replace(/[\u2018\u2019]/g, "'");
+    // "get me ready" asks for the build-up, and "almost ready" / "when I'm ready" are not the signal
+    if (/\b(get|gets|getting|make|makes|making)\s+(me|myself|him|us)\s+ready\b/.test(lower)) return false;
+    if (/\b(almost|nearly|barely|when|until|till|before|once|if|after)\s+(i'm|im|i am|i'm all|the toy is|the toy's)?\s*ready\b/.test(lower)) return false;
+    return isEdgeCall(text, cfg.readyWords || "ready");
+}
+
+/**
+ * [glide mod] Opens the gate. Only works with a device connected.
+ * @returns {boolean} True if the toy is now ready.
+ */
+function markReady() {
+    if (!deviceAvailable()) {
+        toastr?.warning?.('The Handy is not connected, so the toy is not ready yet', 'Handy AI Motion');
+        return false;
+    }
+    if (!Session.ready) {
+        Session.ready = true;
+        Session.readyPendingAck = true;
+        toastr?.success?.('Toy ready', 'Handy AI Motion');
+    }
+    return true;
+}
+
+/** [glide mod] Closes the gate again. Anything moving stops at once. */
+function markNotReady() {
+    const was = Session.ready;
+    Session.ready = false;
+    Session.readyPendingAck = false;
+    if (Glide.active || Date.now() < Glide.cooldownUntil) emergencyStop();
+    return was;
 }
 
 /** [glide mod] Counts an edge, ignoring a second call within 20 seconds of the last. */
@@ -1080,6 +1135,12 @@ const Glide = {
 
     /** Sets new settings to glide toward. pace 0 eases down and stops. */
     setTarget(t) {
+        if (gateLocked() && Number(t?.pace) > 0) {
+            // The user has not said he is ready: nothing starts
+            if (getConfig().debugMode) console.log(`${LOG_PREFIX} Not ready: motion ignored`);
+            this.report();
+            return;
+        }
         if (Date.now() < this.cooldownUntil) {
             // An edge was just called: remember this and apply it when the hold ends
             this.pending = t;
@@ -1398,7 +1459,12 @@ const Glide = {
         } else if (PlaybackState.isPlaying) {
             text = "Playing";
         } else {
-            text = "Idle";
+            text = gateLocked() ? "Not ready" : "Idle";
+        }
+        const btn = document.getElementById("ham_ready_btn");
+        if (btn) {
+            btn.textContent = Session.ready ? "Not ready" : "Ready";
+            btn.style.display = getConfig().readyGate === false ? "none" : "";
         }
         if (Session.edgeCount > 0 || Session.edgeGoal > 0) {
             text += ` | Edges ${Session.edgeCount}${Session.edgeGoal ? '/' + (Session.goalSecret ? '?' : Session.edgeGoal) : ''}`;
@@ -1589,6 +1655,11 @@ function updateSessionNote() {
         const char = ctx.name2 || 'the character';
         const parts = [];
         const cooling = Date.now() < Glide.cooldownUntil;
+        if (gateLocked()) {
+            parts.push(`${user} has not said he is ready yet, so ${char} cannot begin stroking, and the stroking does not start in this reply. Once the mood turns sexual, this is the build-up, and ${char} leads it: his job now is to tease ${user} and get him hard. He does it with his voice, his closeness, kisses, and by telling ${user} in detail what he is going to do to him and how it will feel. He can tell ${user} to touch himself and can ask how hard he is. He takes his time over several replies and lets the anticipation grow; he does not rush to the end of it. When ${user} says he is hard or clearly cannot wait, ${char} tells him to say "ready" when he wants ${char}'s touch. Until then ${char} does not describe stroking or any moving touch on ${user}'s cock as happening. This reply ends with the hand still and has no pace number.`);
+        } else if (Session.readyPendingAck) {
+            parts.push(`${user} has just said he is ready. The build-up is over and ${char} begins now, picking up from the teasing: the first touch is pace 1 or 2.`);
+        }
         if (Glide.active && !Glide.stopping) {
             let s = `${char}'s touch is moving right now at pace ${Math.round(Glide.tgt.pace)}`;
             if (Glide.build) s += ` and ${Glide.build.dir > 0 ? 'climbing' : 'easing'} on its own toward ${Glide.build.to}`;
@@ -2437,6 +2508,12 @@ async function onMessageReceived(messageId) {
         Session.closePendingAck = false;
         Session.followUpReason = null;
         Session.awaitingFollowUp = false;
+        Session.readyPendingAck = false;
+        if (gateLocked()) {
+            // [glide mod] The user has not said he is ready: this reply moves nothing
+            Glide.report();
+            return;
+        }
 
         // [glide mod] Fast path: read "Pace N ..." from the reply's last line, no LLM call needed
         if (settings.glideMode && settings.fastParse) {
@@ -2619,6 +2696,13 @@ async function initExtension() {
     
     $('#ham_disconnect_btn').on('click', disconnectIntiface);
     
+    // [glide mod] Ready button: same as sending "ready" / "not ready"
+    $('#ham_ready_btn').on('click', function() {
+        if (Session.ready) markNotReady(); else markReady();
+        Glide.report();
+        updateSessionNote();
+    });
+
     $('#ham_stop_btn').on('click', function() {
         emergencyStop(); // [glide mod] hold in place instead of jumping to 0
     });
@@ -2720,6 +2804,16 @@ async function initExtension() {
             Session.unprompted = 0;
             Session.queuedFollowUp = null;
 
+            if (cfg.readyGate !== false) {
+                if (/\bnot ready\b/i.test(text)) {
+                    markNotReady();
+                    Glide.report();
+                    updateSessionNote();
+                    return;
+                }
+                if (!Session.ready && isReadyCall(text, cfg)) markReady();
+            }
+
             if ((Glide.active || cooling) && hasStopWord(text, cfg)) {
                 emergencyStop();
                 updateSessionNote();
@@ -2804,6 +2898,8 @@ async function initExtension() {
         Session.goalSecret = false;
         Session.releasing = false;
         Session.finishPendingAck = false;
+        Session.ready = false; // a new chat needs the ready signal again
+        Session.readyPendingAck = false;
         clearFollowUpTimers();
         Glide.cancelCooldown();
         if (Glide.active) Glide.setTarget({ pace: 0 }); // leaving the chat eases the touch to a stop
