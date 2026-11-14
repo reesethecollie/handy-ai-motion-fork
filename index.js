@@ -18,6 +18,9 @@ const defaultSettings = {
     retryOnInvalid: true,
     maxRetries: 3,
     usePatternsFile: false, // Use predefined patterns from patterns.json
+    glideMode: true,         // [glide mod] Blend smoothly between motion settings instead of switching
+    fastParse: true,         // [glide mod] Read "Pace N" from the reply's last line without an LLM call
+    stopWords: "stop,pause", // [glide mod] Words in the user's message that halt the device at once
     analysisPrompt: `AI MESSAGE:
 """
 {{message}}
@@ -459,6 +462,28 @@ function updatePlaybackStatus(isPlaying) {
 }
 
 /* ================================================================================================
+   [glide mod] MOVE TRACKER - estimates where the device is between commands
+================================================================================================ */
+const MoveTracker = {
+    from: 0,
+    to: 0,
+    t0: 0,
+    dur: 0,
+    estimate() {
+        if (!this.dur) return this.to;
+        const f = Math.max(0, Math.min(1, (Date.now() - this.t0) / this.dur));
+        return this.from + (this.to - this.from) * f;
+    },
+    record(position, duration) {
+        const now = this.estimate();
+        this.from = now;
+        this.to = Math.max(0, Math.min(100, Number(position) || 0));
+        this.t0 = Date.now();
+        this.dur = Math.max(0, duration);
+    },
+};
+
+/* ================================================================================================
    DEVICE COMMANDS
 ================================================================================================ */
 const DeviceCommands = {
@@ -490,6 +515,9 @@ const DeviceCommands = {
 
         const pos = this.clampPosition(position);
         const duration = Math.max(0, durationMs);
+
+        // [glide mod] remember this move so the current position can be estimated mid-stroke
+        MoveTracker.record(position, duration);
 
         const settings = getConfig();
         if (settings.debugMode) {
@@ -904,6 +932,7 @@ function startPlayback(data) {
  * Clears any active timeouts and aborts the playback controller.
  */
 function stopPlayback() {
+    Glide.halt(); // [glide mod]
     if (PlaybackState.currentTimeout) {
         clearTimeout(PlaybackState.currentTimeout);
         PlaybackState.currentTimeout = null;
@@ -923,6 +952,227 @@ function stopPlayback() {
     updatePlaybackStatus(false);
     
     console.log(`${LOG_PREFIX} Playback stopped`);
+}
+
+/* ================================================================================================
+   [glide mod] GLIDE ENGINE
+   Keeps the device stroking between two positions at a "pace" (1-10) and moves gradually toward
+   new settings a little on every stroke, so changes are never abrupt.
+================================================================================================ */
+const GLIDE_PACE_STEP = 0.5;   // max pace change per half-stroke
+const GLIDE_RANGE_STEP = 6;    // max change of either end position (%) per half-stroke
+const GLIDE_MIN_SPAN = 8;      // smallest allowed stroke span (%)
+const GLIDE_PACE1_SPEED = 36;  // mm/s at pace 1
+const GLIDE_PACE10_SPEED = 340;// mm/s at pace 10
+
+const Glide = {
+    active: false,
+    stopping: false,
+    easedOut: false,
+    timer: null,
+    dir: 1,
+    cur: { pace: 0, lo: 10, hi: 90, hold: 0 },
+    tgt: { pace: 0, lo: 10, hi: 90, hold: 0 },
+
+    paceToSpeed(pace, settings) {
+        const p = Math.max(1, Math.min(10, pace));
+        const speed = GLIDE_PACE1_SPEED * Math.pow(GLIDE_PACE10_SPEED / GLIDE_PACE1_SPEED, (p - 1) / 9);
+        const minSpeed = settings.minSpeed || 32;
+        const maxSpeed = settings.maxSpeed || 450;
+        return Math.max(minSpeed, Math.min(maxSpeed, speed));
+    },
+
+    /** Normalizes a target object {pace, min, max, hold}. */
+    normalize(t) {
+        let pace = Number(t.pace);
+        if (!isFinite(pace)) pace = 0;
+        pace = Math.max(0, Math.min(10, pace));
+        let lo = Number(t.min);
+        let hi = Number(t.max);
+        if (!isFinite(lo)) lo = 10;
+        if (!isFinite(hi)) hi = 90;
+        lo = Math.max(0, Math.min(100, lo));
+        hi = Math.max(0, Math.min(100, hi));
+        if (lo > hi) [lo, hi] = [hi, lo];
+        if (hi - lo < GLIDE_MIN_SPAN) {
+            const mid = (lo + hi) / 2;
+            lo = Math.max(0, mid - GLIDE_MIN_SPAN / 2);
+            hi = Math.min(100, lo + GLIDE_MIN_SPAN);
+            lo = hi - GLIDE_MIN_SPAN;
+        }
+        let hold = Number(t.hold);
+        if (!isFinite(hold)) hold = 0;
+        hold = Math.max(0, Math.min(3000, hold));
+        return { pace, lo, hi, hold };
+    },
+
+    /** Sets new settings to glide toward. pace 0 eases down and stops. */
+    setTarget(t) {
+        const target = this.normalize(t);
+        const settings = getConfig();
+        if (settings.debugMode) {
+            console.log(`${LOG_PREFIX} Glide target: pace ${target.pace}, ${target.lo}-${target.hi}%, hold ${target.hold}ms`);
+        }
+
+        if (target.pace <= 0) {
+            if (this.active) {
+                this.stopping = true;
+                this.tgt.pace = 0;
+            }
+            return;
+        }
+
+        this.stopping = false;
+        this.easedOut = false;
+        this.tgt = target;
+
+        if (!this.active) {
+            // Stop any classic pattern playback, then start gently from pace 1
+            if (PlaybackState.isPlaying) stopPlayback();
+            this.cur = { pace: Math.min(1, target.pace), lo: target.lo, hi: target.hi, hold: target.hold };
+            const pos = MoveTracker.estimate();
+            this.dir = Math.abs(pos - target.lo) <= Math.abs(pos - target.hi) ? 1 : -1;
+            this.active = true;
+            updatePlaybackStatus(true);
+            this.tick();
+        }
+    },
+
+    approach(value, goal, step) {
+        if (value < goal) return Math.min(goal, value + step);
+        if (value > goal) return Math.max(goal, value - step);
+        return value;
+    },
+
+    tick() {
+        if (!this.active) return;
+        const settings = getConfig();
+
+        if (IntifaceState.defaultDeviceIndex === null) {
+            console.warn(`${LOG_PREFIX} Glide: no device connected, stopping`);
+            this.halt();
+            updatePlaybackStatus(false);
+            return;
+        }
+
+        // Ease toward the target a little on every half-stroke
+        if (this.stopping) {
+            // One last stroke at half the pace, then rest where that stroke ends
+            if (this.easedOut) {
+                this.halt();
+                updatePlaybackStatus(false);
+                console.log(`${LOG_PREFIX} Glide eased to a stop`);
+                return;
+            }
+            this.easedOut = true;
+            this.cur.pace = Math.max(1, this.cur.pace / 2);
+        } else {
+            this.cur.pace = this.approach(this.cur.pace, this.tgt.pace, GLIDE_PACE_STEP);
+            this.cur.lo = this.approach(this.cur.lo, this.tgt.lo, GLIDE_RANGE_STEP);
+            this.cur.hi = this.approach(this.cur.hi, this.tgt.hi, GLIDE_RANGE_STEP);
+            this.cur.hold = this.tgt.hold;
+        }
+
+        const pos = MoveTracker.estimate();
+        let dest = this.dir > 0 ? this.cur.hi : this.cur.lo;
+        if (Math.abs(dest - pos) < 1) {
+            this.dir = -this.dir;
+            dest = this.dir > 0 ? this.cur.hi : this.cur.lo;
+        }
+
+        const strokeLength = settings.strokeLength || 125;
+        const distanceMm = (Math.abs(dest - pos) / 100) * strokeLength;
+        const speed = this.paceToSpeed(this.cur.pace, settings);
+        const duration = Math.max(120, Math.round((distanceMm / speed) * 1000));
+
+        PlaybackState.currentPosition = dest;
+        DeviceCommands.linear(Math.round(dest), duration);
+
+        const pause = (this.dir > 0 && this.cur.hold > 0 && !this.stopping) ? this.cur.hold : 0;
+        this.dir = -this.dir;
+        this.timer = setTimeout(() => this.tick(), duration + pause);
+    },
+
+    /** Stops the engine's timer without sending anything to the device. */
+    halt() {
+        if (this.timer) {
+            clearTimeout(this.timer);
+            this.timer = null;
+        }
+        this.active = false;
+        this.stopping = false;
+        this.easedOut = false;
+        this.cur.pace = 0;
+    },
+};
+
+/**
+ * [glide mod] Halts everything at once and holds the device where it is (no jump to 0).
+ */
+function emergencyStop() {
+    const pos = MoveTracker.estimate();
+    stopPlayback();
+    if (IntifaceState.defaultDeviceIndex === null) return;
+    DeviceCommands.linear(Math.round(pos), 150);
+    PlaybackState.currentPosition = Math.round(pos);
+    if (IntifaceState.deviceCapabilities.canStopDevice) {
+        setTimeout(() => {
+            intifaceSend({
+                StopDeviceCmd: {
+                    Id: IntifaceState.messageId++,
+                    DeviceIndex: IntifaceState.defaultDeviceIndex,
+                }
+            });
+        }, 200);
+    }
+    console.log(`${LOG_PREFIX} Emergency stop at ${Math.round(pos)}%`);
+}
+
+/**
+ * [glide mod] Reads the motion line at the end of a reply, e.g.
+ * "*Pace 4: full strokes, whole length, even rhythm.*" or "*Julian's hand is still.*"
+ * @param {string} text - The full reply text.
+ * @returns {{pace:number,min:number,max:number,hold:number}|null} Target, or null if no motion line found.
+ */
+function parseMotionLine(text) {
+    if (!text) return null;
+    const lines = String(text).split(/\r?\n/).map(l => l.replace(/[*_`]/g, '').trim()).filter(Boolean);
+    if (lines.length === 0) return null;
+    const line = lines[lines.length - 1].toLowerCase();
+
+    const paceMatch = line.match(/\bpace\s*:?\s*(\d+(?:\.\d+)?)/);
+    if (!paceMatch) {
+        if (/\b(still|stopped|resting|off you|not touching|nothing is touching)\b/.test(line)) {
+            return { pace: 0, min: 10, max: 90, hold: 0 };
+        }
+        return null;
+    }
+
+    const pace = parseFloat(paceMatch[1]);
+    let min = 10, max = 90;
+    if (/\b(tip|head|top)\b/.test(line)) { min = 70; max = 100; }
+    else if (/\bbase\b|\bbottom\b/.test(line)) { min = 0; max = 30; }
+    else if (/\bupper half\b/.test(line)) { min = 50; max = 100; }
+    else if (/\blower half\b/.test(line)) { min = 0; max = 50; }
+    else if (/\bmiddle\b|\bmid\b/.test(line)) { min = 35; max = 65; }
+    else if (/\bshort\b/.test(line)) { min = 35; max = 65; }
+
+    const hold = /\bpaus(e|es|ing)\b/.test(line) ? 800 : 0;
+    return { pace, min, max, hold };
+}
+
+/**
+ * [glide mod] True if the user's message asks to stop (but not "don't stop").
+ */
+function hasStopWord(text, settings) {
+    if (!text) return false;
+    const words = String(settings.stopWords || 'stop,pause').split(',').map(w => w.trim().toLowerCase()).filter(Boolean);
+    if (words.length === 0) return false;
+    const escaped = words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    const lower = String(text).toLowerCase();
+    const negated = new RegExp(`\\b(don'?t|do not|dont|never|not|no need to)\\s+(${escaped})\\b`);
+    const cleaned = lower.replace(new RegExp(negated.source, 'g'), ' ');
+    return new RegExp(`\\b(${escaped})\\b`).test(cleaned);
 }
 
 /* ================================================================================================
@@ -1165,7 +1415,7 @@ function extractJsonFromResponse(response, debugMode = false) {
         for (const match of anyJsonMatch) {
             try {
                 const parsed = JSON.parse(match);
-                if (parsed.start || parsed.loop) {
+                if (parsed.start || parsed.loop || parsed.pace !== undefined) {
                     if (debugMode) {
                         console.log(`${LOG_PREFIX} Found JSON object with movement data`);
                     }
@@ -1471,7 +1721,7 @@ async function performLLMAnalysis(message, settings, fullContext = []) {
             const parsed = JSON.parse(jsonStr);
             
             // Validate the parsed data has required structure
-            if (!parsed.start && !parsed.loop) {
+            if (!parsed.start && !parsed.loop && parsed.pace === undefined) {
                 return { success: false, error: "JSON missing 'start' or 'loop' arrays" };
             }
             
@@ -1606,14 +1856,36 @@ async function onMessageReceived(messageId) {
             console.log(`${LOG_PREFIX} Processing message ${messageId}: ${messageText.substring(0, 100)}...`);
         }
         
+        // [glide mod] Only the AI's replies drive the device
+        if (message.is_user) {
+            return;
+        }
+
+        // [glide mod] Fast path: read "Pace N ..." from the reply's last line, no LLM call needed
+        if (settings.glideMode && settings.fastParse) {
+            const target = parseMotionLine(messageText);
+            if (target) {
+                if (settings.debugMode) {
+                    console.log(`${LOG_PREFIX} Motion line parsed directly:`, target);
+                }
+                Glide.setTarget(target);
+                return;
+            }
+        }
+
         // Analyze the message with LLM
         const movementData = await analyzeMessageWithLLM(messageText, chat);
         
         if (movementData) {
-            if (settings.debugMode) {
-                console.log(`${LOG_PREFIX} Starting playback with movement data`);
+            if (settings.glideMode && movementData.pace !== undefined) {
+                // [glide mod] pace-style result: blend toward it
+                Glide.setTarget(movementData);
+            } else {
+                if (settings.debugMode) {
+                    console.log(`${LOG_PREFIX} Starting playback with movement data`);
+                }
+                startPlayback(movementData);
             }
-            startPlayback(movementData);
         }
     } catch (err) {
         console.error(`${LOG_PREFIX} Error in onMessageReceived:`, err);
@@ -1650,6 +1922,10 @@ async function reloadPatterns() {
  * Initializes the extension settings and UI.
  */
 async function initExtension() {
+    // [glide mod] bug fix: the settings object was never created, so no setting change was ever kept
+    if (!extension_settings[extensionName]) {
+        extension_settings[extensionName] = {};
+    }
     const settings = getConfig();
     
     // Create settings HTML
@@ -1760,8 +2036,7 @@ async function initExtension() {
     $('#ham_disconnect_btn').on('click', disconnectIntiface);
     
     $('#ham_stop_btn').on('click', function() {
-        stopPlayback();
-        DeviceCommands.stopAll();
+        emergencyStop(); // [glide mod] hold in place instead of jumping to 0
     });
     
     // Reset prompt button
@@ -1792,7 +2067,11 @@ async function initExtension() {
         
         if (result) {
             toastr?.success?.('Analysis complete, starting playback', 'Handy AI Motion');
-            startPlayback(result);
+            if (getConfig().glideMode && result.pace !== undefined) {
+                Glide.setTarget(result); // [glide mod]
+            } else {
+                startPlayback(result);
+            }
         } else {
             toastr?.error?.('Analysis failed', 'Handy AI Motion');
         }
@@ -1835,7 +2114,21 @@ async function initExtension() {
     
     // Register event listener for incoming messages
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-    eventSource.on(event_types.MESSAGE_SENT, () => {
+    eventSource.on(event_types.MESSAGE_SENT, (messageId) => {
+        const cfg = getConfig();
+        // [glide mod] In glide mode the motion carries on while you chat,
+        // unless your message contains a stop word.
+        if (cfg.glideMode && Glide.active) {
+            let text = '';
+            try {
+                const ctx = window.SillyTavern?.getContext();
+                text = ctx?.chat?.[messageId]?.mes || '';
+            } catch { /* ignore */ }
+            if (hasStopWord(text, cfg)) {
+                emergencyStop();
+            }
+            return;
+        }
         // Stop playback when user sends a message
         stopPlayback();
     });
