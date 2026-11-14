@@ -21,6 +21,11 @@ const defaultSettings = {
     glideMode: true,         // [glide mod] Blend smoothly between motion settings instead of switching
     fastParse: true,         // [glide mod] Read "Pace N" from the reply's last line without an LLM call
     stopWords: "stop,pause", // [glide mod] Words in the user's message that halt the device at once
+    variation: 0.5,          // [glide mod] 0-1: how much natural variation is added when the rhythm is not "even"
+    buildIntervalSec: 20,    // [glide mod] seconds per pace level while "building" or "easing"
+    edgeCooldownSec: 10,     // [glide mod] seconds the device stays still after an edge is called
+    edgeWords: "edge,i'm close,im close,so close,too close,about to cum,gonna cum,going to cum", // [glide mod]
+    sessionNote: true,       // [glide mod] tell the character the real pace and edge count each turn
     analysisPrompt: `AI MESSAGE:
 """
 {{message}}
@@ -965,14 +970,28 @@ const GLIDE_MIN_SPAN = 8;      // smallest allowed stroke span (%)
 const GLIDE_PACE1_SPEED = 36;  // mm/s at pace 1
 const GLIDE_PACE10_SPEED = 340;// mm/s at pace 10
 
+// Edge tracking for the current chat
+const Session = {
+    edgeCount: 0,
+    edgeGoal: 0,
+    edgePendingAck: false, // an edge was called and the character has not replied yet
+};
+
 const Glide = {
     active: false,
     stopping: false,
     easedOut: false,
     timer: null,
     dir: 1,
-    cur: { pace: 0, lo: 10, hi: 90, hold: 0 },
-    tgt: { pace: 0, lo: 10, hi: 90, hold: 0 },
+    cur: { pace: 0, lo: 10, hi: 90, hold: 0, vary: 1 },
+    tgt: { pace: 0, lo: 10, hi: 90, hold: 0, vary: 1 },
+    build: null,          // { to, dir, nextAt } while the pace is climbing or easing on its own
+    cooldownUntil: 0,     // after an edge, nothing moves until this time
+    cooldownTimer: null,
+    pending: null,        // target received during an edge cooldown
+    jitter: 0,            // slow random drift of stroke speed
+    fx: null,             // short-lived variation: { type, left }
+    sinceFx: 0,
 
     paceToSpeed(pace, settings) {
         const p = Math.max(1, Math.min(10, pace));
@@ -982,7 +1001,7 @@ const Glide = {
         return Math.max(minSpeed, Math.min(maxSpeed, speed));
     },
 
-    /** Normalizes a target object {pace, min, max, hold}. */
+    /** Normalizes a target object {pace, min, max, hold, vary, buildTo}. */
     normalize(t) {
         let pace = Number(t.pace);
         if (!isFinite(pace)) pace = 0;
@@ -1003,39 +1022,63 @@ const Glide = {
         let hold = Number(t.hold);
         if (!isFinite(hold)) hold = 0;
         hold = Math.max(0, Math.min(3000, hold));
-        return { pace, lo, hi, hold };
+        const vary = (t.vary === undefined || t.vary === null) ? 1 : (Number(t.vary) > 0 ? 1 : 0);
+        let buildTo = (t.buildTo === undefined || t.buildTo === null) ? null : Number(t.buildTo);
+        if (buildTo !== null) {
+            buildTo = isFinite(buildTo) ? Math.max(1, Math.min(10, buildTo)) : null;
+        }
+        return { pace, lo, hi, hold, vary, buildTo };
     },
 
     /** Sets new settings to glide toward. pace 0 eases down and stops. */
     setTarget(t) {
+        if (Date.now() < this.cooldownUntil) {
+            // An edge was just called: remember this and apply it when the hold ends
+            this.pending = t;
+            return;
+        }
+
         const target = this.normalize(t);
         const settings = getConfig();
         if (settings.debugMode) {
-            console.log(`${LOG_PREFIX} Glide target: pace ${target.pace}, ${target.lo}-${target.hi}%, hold ${target.hold}ms`);
+            console.log(`${LOG_PREFIX} Glide target: pace ${target.pace}, ${target.lo}-${target.hi}%, hold ${target.hold}ms, vary ${target.vary}, buildTo ${target.buildTo}`);
         }
 
         if (target.pace <= 0) {
+            this.build = null;
             if (this.active) {
                 this.stopping = true;
                 this.tgt.pace = 0;
             }
+            this.report();
             return;
         }
 
         this.stopping = false;
         this.easedOut = false;
-        this.tgt = target;
+        this.tgt = { pace: target.pace, lo: target.lo, hi: target.hi, hold: target.hold, vary: target.vary };
+
+        if (target.buildTo !== null && target.buildTo !== target.pace) {
+            const interval = Math.max(5, Number(settings.buildIntervalSec) || 20) * 1000;
+            this.build = { to: target.buildTo, dir: target.buildTo > target.pace ? 1 : -1, nextAt: Date.now() + interval };
+        } else {
+            this.build = null;
+        }
 
         if (!this.active) {
             // Stop any classic pattern playback, then start gently from pace 1
             if (PlaybackState.isPlaying) stopPlayback();
-            this.cur = { pace: Math.min(1, target.pace), lo: target.lo, hi: target.hi, hold: target.hold };
+            this.cur = { pace: Math.min(1, target.pace), lo: target.lo, hi: target.hi, hold: target.hold, vary: target.vary };
             const pos = MoveTracker.estimate();
             this.dir = Math.abs(pos - target.lo) <= Math.abs(pos - target.hi) ? 1 : -1;
+            this.jitter = 0;
+            this.fx = null;
+            this.sinceFx = 0;
             this.active = true;
             updatePlaybackStatus(true);
             this.tick();
         }
+        this.report();
     },
 
     approach(value, goal, step) {
@@ -1052,7 +1095,21 @@ const Glide = {
             console.warn(`${LOG_PREFIX} Glide: no device connected, stopping`);
             this.halt();
             updatePlaybackStatus(false);
+            this.report();
             return;
+        }
+
+        // Self-building pace: raise or lower the target one level at a time
+        if (this.build && !this.stopping && Date.now() >= this.build.nextAt) {
+            const interval = Math.max(5, Number(settings.buildIntervalSec) || 20) * 1000;
+            const next = this.tgt.pace + this.build.dir;
+            if ((this.build.dir > 0 && next >= this.build.to) || (this.build.dir < 0 && next <= this.build.to)) {
+                this.tgt.pace = this.build.to;
+                this.build = null;
+            } else {
+                this.tgt.pace = next;
+                this.build.nextAt = Date.now() + interval;
+            }
         }
 
         // Ease toward the target a little on every half-stroke
@@ -1061,6 +1118,7 @@ const Glide = {
             if (this.easedOut) {
                 this.halt();
                 updatePlaybackStatus(false);
+                this.report();
                 console.log(`${LOG_PREFIX} Glide eased to a stop`);
                 return;
             }
@@ -1071,6 +1129,39 @@ const Glide = {
             this.cur.lo = this.approach(this.cur.lo, this.tgt.lo, GLIDE_RANGE_STEP);
             this.cur.hi = this.approach(this.cur.hi, this.tgt.hi, GLIDE_RANGE_STEP);
             this.cur.hold = this.tgt.hold;
+            this.cur.vary = this.tgt.vary;
+        }
+
+        // Natural variation (off for an "even" rhythm and while easing to a stop)
+        const amount = (this.stopping || !this.cur.vary) ? 0 : Math.max(0, Math.min(1, Number(settings.variation ?? 0.5)));
+        let speedFactor = 1;
+        let extraPause = 0;
+        let shorten = false;
+        if (amount > 0) {
+            // Slow drift of speed, at most about 12%
+            const limit = 0.12 * amount;
+            this.jitter = Math.max(-limit, Math.min(limit, this.jitter * 0.7 + (Math.random() - 0.5) * 0.12 * amount));
+            speedFactor += this.jitter;
+
+            // Now and then: a brief pause, a slower stroke, a slightly quicker run, or a short stroke
+            this.sinceFx++;
+            if (!this.fx && this.sinceFx > 6 && Math.random() < 0.14 * amount) {
+                const types = ['pause', 'slow', 'burst', 'short'];
+                const type = types[Math.floor(Math.random() * types.length)];
+                this.fx = { type, left: type === 'burst' ? 4 : (type === 'pause' ? 1 : 2) };
+                this.sinceFx = 0;
+            }
+            if (this.fx) {
+                if (this.fx.type === 'pause') extraPause = 400 + Math.round(Math.random() * 500);
+                else if (this.fx.type === 'slow') speedFactor *= 0.75;
+                else if (this.fx.type === 'burst') speedFactor *= 1.15;
+                else if (this.fx.type === 'short') shorten = true;
+                this.fx.left--;
+                if (this.fx.left <= 0) this.fx = null;
+            }
+        } else {
+            this.jitter = 0;
+            this.fx = null;
         }
 
         const pos = MoveTracker.estimate();
@@ -1079,10 +1170,22 @@ const Glide = {
             this.dir = -this.dir;
             dest = this.dir > 0 ? this.cur.hi : this.cur.lo;
         }
+        if (amount > 0) {
+            const span = this.cur.hi - this.cur.lo;
+            // Vary where each stroke ends a little; a "short" stroke turns back near the middle
+            if (shorten && span > 2 * GLIDE_MIN_SPAN) {
+                dest = dest + (this.dir > 0 ? -1 : 1) * span * 0.4;
+            } else {
+                dest += (Math.random() - 0.5) * 2 * Math.min(5, span * 0.08) * amount;
+            }
+            dest = Math.max(0, Math.min(100, dest));
+        }
 
         const strokeLength = settings.strokeLength || 125;
         const distanceMm = (Math.abs(dest - pos) / 100) * strokeLength;
-        const speed = this.paceToSpeed(this.cur.pace, settings);
+        const minSpeed = settings.minSpeed || 32;
+        const maxSpeed = settings.maxSpeed || 450;
+        const speed = Math.max(minSpeed, Math.min(maxSpeed, this.paceToSpeed(this.cur.pace, settings) * speedFactor));
         const duration = Math.max(120, Math.round((distanceMm / speed) * 1000));
 
         PlaybackState.currentPosition = dest;
@@ -1090,7 +1193,47 @@ const Glide = {
 
         const pause = (this.dir > 0 && this.cur.hold > 0 && !this.stopping) ? this.cur.hold : 0;
         this.dir = -this.dir;
-        this.timer = setTimeout(() => this.tick(), duration + pause);
+        this.timer = setTimeout(() => this.tick(), duration + pause + extraPause);
+        this.report();
+    },
+
+    /**
+     * An edge was called: hold still right away, and keep still for the cooldown.
+     * Whatever the character asks for during the cooldown starts gently once it is over.
+     */
+    edge(settings) {
+        const pos = MoveTracker.estimate();
+        this.halt();
+        this.build = null;
+        this.pending = null;
+        updatePlaybackStatus(false);
+        if (IntifaceState.defaultDeviceIndex !== null) {
+            DeviceCommands.linear(Math.round(pos), 150);
+            PlaybackState.currentPosition = Math.round(pos);
+        }
+        const cooldown = Math.max(0, Number(settings.edgeCooldownSec ?? 10)) * 1000;
+        this.cooldownUntil = Date.now() + cooldown;
+        if (this.cooldownTimer) clearTimeout(this.cooldownTimer);
+        this.cooldownTimer = setTimeout(() => {
+            this.cooldownTimer = null;
+            this.cooldownUntil = 0;
+            const p = this.pending;
+            this.pending = null;
+            if (p) this.setTarget(p);
+            this.report();
+        }, cooldown);
+        console.log(`${LOG_PREFIX} Edge ${Session.edgeCount}${Session.edgeGoal ? '/' + Session.edgeGoal : ''}: holding for ${cooldown / 1000}s`);
+        this.report();
+    },
+
+    /** Forgets an edge cooldown and anything waiting behind it. */
+    cancelCooldown() {
+        if (this.cooldownTimer) {
+            clearTimeout(this.cooldownTimer);
+            this.cooldownTimer = null;
+        }
+        this.cooldownUntil = 0;
+        this.pending = null;
     },
 
     /** Stops the engine's timer without sending anything to the device. */
@@ -1102,7 +1245,31 @@ const Glide = {
         this.active = false;
         this.stopping = false;
         this.easedOut = false;
+        this.build = null;
+        this.fx = null;
         this.cur.pace = 0;
+    },
+
+    /** Shows the live pace and edge count in the extension panel. */
+    report() {
+        const el = document.getElementById("ham_playback_status");
+        if (!el) return;
+        let text;
+        if (Date.now() < this.cooldownUntil) {
+            text = "Edge hold";
+        } else if (this.active) {
+            text = `Pace ${this.cur.pace.toFixed(1)}`;
+            if (!this.stopping && Math.abs(this.tgt.pace - this.cur.pace) > 0.05) text += ` > ${this.tgt.pace}`;
+            if (this.build) text += ` (${this.build.dir > 0 ? 'building' : 'easing'} to ${this.build.to})`;
+        } else if (PlaybackState.isPlaying) {
+            text = "Playing";
+        } else {
+            text = "Idle";
+        }
+        if (Session.edgeCount > 0 || Session.edgeGoal > 0) {
+            text += ` | Edges ${Session.edgeCount}${Session.edgeGoal ? '/' + Session.edgeGoal : ''}`;
+        }
+        el.textContent = text;
     },
 };
 
@@ -1111,7 +1278,9 @@ const Glide = {
  */
 function emergencyStop() {
     const pos = MoveTracker.estimate();
+    Glide.cancelCooldown();
     stopPlayback();
+    Glide.report();
     if (IntifaceState.defaultDeviceIndex === null) return;
     DeviceCommands.linear(Math.round(pos), 150);
     PlaybackState.currentPosition = Math.round(pos);
@@ -1126,6 +1295,92 @@ function emergencyStop() {
         }, 200);
     }
     console.log(`${LOG_PREFIX} Emergency stop at ${Math.round(pos)}%`);
+}
+
+/**
+ * [glide mod] Gives the character the real state of the session (pace, edges) on every turn,
+ * as a hidden note at the end of the chat.
+ */
+function updateSessionNote() {
+    try {
+        const ctx = window.SillyTavern?.getContext();
+        if (!ctx || typeof ctx.setExtensionPrompt !== 'function') return;
+        const settings = getConfig();
+        const KEY = 'handy_ai_motion_state';
+        if (!settings.enabled || !settings.glideMode || settings.sessionNote === false) {
+            ctx.setExtensionPrompt(KEY, '', 1, 0);
+            return;
+        }
+        const user = ctx.name1 || 'the user';
+        const char = ctx.name2 || 'the character';
+        const parts = [];
+        const cooling = Date.now() < Glide.cooldownUntil;
+        if (Glide.active && !Glide.stopping) {
+            let s = `${char}'s touch is moving right now at pace ${Math.round(Glide.tgt.pace)}`;
+            if (Glide.build) s += ` and ${Glide.build.dir > 0 ? 'climbing' : 'easing'} on its own toward ${Glide.build.to}`;
+            parts.push(s + '.');
+        } else {
+            parts.push(`${char}'s hand is still right now.`);
+        }
+        if (Session.edgePendingAck || cooling) {
+            parts.push(`${user} just called an edge, and the touch has already stopped on its own. This reply must end with the hand still.`);
+        }
+        if (Session.edgeCount > 0 || Session.edgeGoal > 0) {
+            let s = `Edges so far: ${Session.edgeCount}`;
+            if (Session.edgeGoal > 0) {
+                s += ` of a goal of ${Session.edgeGoal}.`;
+                s += Session.edgeCount >= Session.edgeGoal
+                    ? ` The goal is reached, so ${char} may let ${user} finish.`
+                    : ` ${char} does not let ${user} finish before the goal.`;
+            } else {
+                s += '.';
+            }
+            parts.push(s);
+        }
+        const text = `[Session note for ${char}. Never mention or repeat this note. ${parts.join(' ')}]`;
+        ctx.setExtensionPrompt(KEY, text, 1, 0, false, 0);
+    } catch (err) {
+        console.warn(`${LOG_PREFIX} Could not update session note:`, err);
+    }
+}
+
+/**
+ * [glide mod] Reads an edge goal from the user's message, e.g. "edge goal 5" or "edge me five times".
+ * @returns {number} The goal, or 0 if the message does not set one.
+ */
+function parseEdgeGoal(text) {
+    if (!text) return 0;
+    const lower = String(text).toLowerCase();
+    const num = '(\\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)';
+    const m = lower.match(new RegExp(`\\bedge goal\\s*(?:of|is|to|:|=)?\\s*${num}\\b`))
+        || lower.match(new RegExp(`\\bedge me\\s+${num}\\s+times?\\b`))
+        || lower.match(new RegExp(`\\b(?:goal|want|do|give me|make it|for)\\D{0,15}${num}\\s+edges\\b`));
+    if (!m) return 0;
+    const words = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+    const n = words[m[1]] ?? parseInt(m[1]);
+    return (isFinite(n) && n >= 1 && n <= 50) ? n : 0;
+}
+
+/**
+ * [glide mod] True if the user's message calls an edge: a short message with the word "edge",
+ * or a phrase such as "I'm close".
+ */
+function isEdgeCall(text, settings) {
+    if (!text) return false;
+    const lower = String(text).toLowerCase().replace(/[‘’]/g, "'");
+    const wordCount = lower.split(/\s+/).filter(Boolean).length;
+    const phrases = String(settings.edgeWords || 'edge').split(',').map(w => w.trim().toLowerCase()).filter(Boolean);
+    for (const phrase of phrases) {
+        const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const m = lower.match(new RegExp(`\\b${escaped}\\b`));
+        if (!m) continue;
+        // A single word such as "edge" only counts in a short message
+        if (!phrase.includes(' ') && wordCount > 5) continue;
+        const before = lower.slice(Math.max(0, m.index - 12), m.index);
+        if (/(\bnot|n't|\bno|\bnever)\s+$/.test(before)) continue;
+        return true;
+    }
+    return false;
 }
 
 /**
@@ -1158,7 +1413,19 @@ function parseMotionLine(text) {
     else if (/\bshort\b/.test(line)) { min = 35; max = 65; }
 
     const hold = /\bpaus(e|es|ing)\b/.test(line) ? 800 : 0;
-    return { pace, min, max, hold };
+
+    // Rhythm: "even" is exact and steady; "natural" (or varied, teasing) adds small variation
+    let vary = 1;
+    if (/\beven\b/.test(line) && !/\b(natural|varied|varying|teasing|playful|uneven)\b/.test(line)) vary = 0;
+
+    // "building to 7" / "easing to 2": the pace then changes one level at a time on its own
+    let buildTo = null;
+    const up = line.match(/\b(?:building|climbing|rising)(?:\s+up)?(?:\s+to\s+(\d+(?:\.\d+)?))?/);
+    const down = line.match(/\b(?:easing|slowing|winding)(?:\s+down)?(?:\s+to\s+(\d+(?:\.\d+)?))?/);
+    if (up) buildTo = up[1] ? parseFloat(up[1]) : Math.min(10, pace + 2);
+    else if (down) buildTo = down[1] ? parseFloat(down[1]) : Math.max(1, pace - 2);
+
+    return { pace, min, max, hold, vary, buildTo };
 }
 
 /**
@@ -1860,6 +2127,7 @@ async function onMessageReceived(messageId) {
         if (message.is_user) {
             return;
         }
+        Session.edgePendingAck = false;
 
         // [glide mod] Fast path: read "Pace N ..." from the reply's last line, no LLM call needed
         if (settings.glideMode && settings.fastParse) {
@@ -2116,21 +2384,60 @@ async function initExtension() {
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
     eventSource.on(event_types.MESSAGE_SENT, (messageId) => {
         const cfg = getConfig();
-        // [glide mod] In glide mode the motion carries on while you chat,
-        // unless your message contains a stop word.
-        if (cfg.glideMode && Glide.active) {
+        // [glide mod] In glide mode the motion carries on while you chat. Your message can
+        // stop it at once, call an edge, or set an edge goal.
+        if (cfg.glideMode) {
             let text = '';
             try {
                 const ctx = window.SillyTavern?.getContext();
                 text = ctx?.chat?.[messageId]?.mes || '';
             } catch { /* ignore */ }
-            if (hasStopWord(text, cfg)) {
+
+            const cooling = Date.now() < Glide.cooldownUntil;
+            const moving = Glide.active && !Glide.stopping;
+
+            if ((Glide.active || cooling) && hasStopWord(text, cfg)) {
                 emergencyStop();
+                updateSessionNote();
+                return;
             }
-            return;
+
+            const goal = parseEdgeGoal(text);
+            if (goal > 0) {
+                Session.edgeGoal = goal;
+                Session.edgeCount = 0;
+                toastr?.info?.(`Edge goal set to ${goal}`, 'Handy AI Motion');
+            } else if (/\breset edges?\b/i.test(text)) {
+                Session.edgeCount = 0;
+                Session.edgeGoal = 0;
+            } else if (moving && isEdgeCall(text, cfg)) {
+                Session.edgeCount++;
+                Session.edgePendingAck = true;
+                Glide.edge(cfg);
+            }
+
+            Glide.report();
+            updateSessionNote();
+            if (Glide.active || Date.now() < Glide.cooldownUntil) {
+                return;
+            }
         }
         // Stop playback when user sends a message
         stopPlayback();
+    });
+
+    // [glide mod] keep the session note current for regenerations and swipes too
+    eventSource.on(event_types.GENERATION_STARTED, () => {
+        updateSessionNote();
+    });
+
+    // [glide mod] a different chat starts with a clean edge count
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        Session.edgeCount = 0;
+        Session.edgeGoal = 0;
+        Session.edgePendingAck = false;
+        Glide.report();
+        updateSessionNote();
     });
     
     console.log(`${LOG_PREFIX} Extension initialized`);
